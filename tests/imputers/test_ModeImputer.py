@@ -1,0 +1,327 @@
+import narwhals as nw
+import numpy as np
+import polars as pl
+import pytest
+
+from tests.base_tests import (
+    ColumnStrListInitTests,
+    EmptyColumnsFitTransformPassTests,
+    FailedFitWeightFilterTest,
+    GenericFitTests,
+    GenericTransformTests,
+    OtherBaseBehaviourTests,
+    ReturnNativeTests,
+    WeightColumnFitMixinTests,
+    WeightColumnInitMixinTests,
+)
+from tests.imputers.test_BaseImputer import (
+    GenericImputerTransformTests,
+    GenericImputerTransformTestsWeight,
+)
+from tests.utils import (
+    _convert_to_lazy,
+    assert_frame_equal_dispatch,
+    dataframe_init_dispatch,
+)
+from tubular.imputers import ModeImputer
+
+
+def input_df_nan(library="pandas"):
+    return dataframe_init_dispatch(
+        dataframe_dict={"a": [None, None, None]},
+        library=library,
+    )
+
+
+class TestInit(ColumnStrListInitTests, WeightColumnInitMixinTests):
+    """Generic tests for transformer.init()."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.transformer_name = "ModeImputer"
+
+
+class TestFit(WeightColumnFitMixinTests, GenericFitTests, FailedFitWeightFilterTest):
+    """Generic tests for transformer.fit()"""
+
+    @classmethod
+    def setup_class(cls):
+        cls.transformer_name = "ModeImputer"
+
+    @pytest.mark.parametrize(
+        "library",
+        ["pandas", "polars"],
+    )
+    @pytest.mark.parametrize("lazy", [True, False])
+    def test_learnt_values(self, library, lazy):
+        """Test that the impute values learnt during fit are expected."""
+
+        df_dict = {
+            # skipping int, as non-nullable for pandas
+            # float
+            "float_col": [1.0, 2.0, 1.0, None, 3.0],
+            # str
+            "str_col": ["a", "b", "b", None, None],
+            # bool
+            "bool_col": [True, True, None, False, True],
+            # cat
+            "cat_col": ["b", "b", "d", "e", None],
+            # null majority
+            "null_col": [None, None, None, "a", "b"],
+        }
+
+        df = dataframe_init_dispatch(df_dict, library=library)
+
+        # create categorical col
+        df = nw.from_native(df)
+        df = nw.to_native(df.with_columns(nw.col("cat_col").cast(nw.Categorical)))
+
+        x = ModeImputer(
+            columns=["float_col", "str_col", "cat_col", "bool_col", "null_col"]
+        )
+
+        x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        expected_impute_values = {
+            "float_col": 1.0,
+            "str_col": "b",
+            "cat_col": "b",
+            "bool_col": True,
+            "null_col": "b",
+        }
+
+        assert x.impute_values_ == expected_impute_values, (
+            f"impute_values_ attribute not expected, expected {expected_impute_values} but got {x.impute_values_}"
+        )
+
+    @pytest.mark.parametrize(
+        "library",
+        ["pandas", "polars"],
+    )
+    @pytest.mark.parametrize("lazy", [True, False])
+    def test_learnt_values_tied(self, library, lazy):
+        """Test that the impute values learnt during fit are expected - when mode is tied."""
+
+        df_dict = {
+            # skipping int, as non-nullable for pandas
+            # float
+            "float_col": [1.0, 2.0, 1.0, None, 2.0],
+            # str
+            "str_col": ["a", "b", "b", "a", None],
+            # bool
+            "bool_col": [True, True, None, False, False],
+            # cat
+            "cat_col": ["b", "b", "e", "e", None],
+        }
+
+        df = dataframe_init_dispatch(df_dict, library=library)
+
+        # create categorical col
+        df = nw.from_native(df)
+        df = nw.to_native(df.with_columns(nw.col("cat_col").cast(nw.Categorical)))
+
+        columns = ["float_col", "str_col", "cat_col", "bool_col"]
+        x = ModeImputer(columns=columns)
+
+        x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        expected_impute_values = {
+            "float_col": 2.0,
+            "str_col": "b",
+            "cat_col": "e",
+            "bool_col": True,
+        }
+
+        with pytest.warns(
+            UserWarning,  # noqa: PT030
+        ) as warnings:
+            x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        columns.sort()
+        warnings = [w.message.args[0] for w in warnings]
+        for col in columns:
+            msg = f"ModeImputer: The Mode of column {col} is tied, will sort in descending order and return first candidate"
+            assert msg in warnings
+
+        assert x.impute_values_ == expected_impute_values, (
+            f"impute_values_ attribute not expected, expected {expected_impute_values} but got {x.impute_values_}"
+        )
+
+    @pytest.mark.parametrize(
+        "library",
+        ["pandas", "polars"],
+    )
+    @pytest.mark.parametrize("lazy", [True, False])
+    @pytest.mark.parametrize(
+        ("input_col", "weight_col", "learnt_value", "categorical"),
+        [
+            # float
+            ([1.0, 2.0, None], [2, 2, 2], 2.0, False),
+            # str
+            (["a", "b", "a", "b", None], [2, 1, 1, 2, 4], "b", False),
+            # bool
+            ([True, False, None], [4, 4, 1], True, False),
+            # cat
+            (["g", "g", "h", None], [2, 2, 4, 1], "h", True),
+        ],
+    )
+    def test_learnt_values_tied_weighted(
+        self,
+        library,
+        input_col,
+        weight_col,
+        learnt_value,
+        categorical,
+        lazy,
+    ):
+        """
+        Test that the impute values learnt during fit are expected -
+        when mode is tied and transformer is weighted.
+        """
+        df_dict = {
+            "col": input_col,
+            "weight": weight_col,
+        }
+
+        df = dataframe_init_dispatch(df_dict, library=library)
+
+        if categorical:
+            # create categorical col
+            df = nw.from_native(df)
+            df = nw.to_native(df.with_columns(nw.col("col").cast(nw.Categorical)))
+
+        columns = ["col"]
+        x = ModeImputer(columns=columns, weights_column="weight")
+
+        x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        expected_impute_values = {
+            "col": learnt_value,
+        }
+        msg = f"ModeImputer: The Mode of column {columns[0]} is tied, will sort in descending order and return first candidate"
+        with pytest.warns(UserWarning, match=msg) as warnings:
+            x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        columns.sort()
+        warnings = [w.message.args[0] for w in warnings]
+        for col in columns:
+            msg = f"ModeImputer: The Mode of column {col} is tied, will sort in descending order and return first candidate"
+            assert msg in warnings
+
+        assert x.impute_values_ == expected_impute_values, (
+            f"impute_values_ attribute not expected, expected {expected_impute_values} but got {x.impute_values_}"
+        )
+
+    @pytest.mark.parametrize(
+        "library",
+        ["pandas", "polars"],
+    )
+    @pytest.mark.parametrize("lazy", [True, False])
+    @pytest.mark.parametrize(
+        ("input_col", "weight_col", "learnt_value", "categorical"),
+        [
+            # float
+            ([1.0, 2.0, 2.0, np.nan], [2, 2, 2, 1], 2.0, False),
+            # str
+            (["a", "b", "a", "b", None, "b"], [2, 1, 1, 2, 4, 3], "b", False),
+            # bool
+            ([True, False, None, True, True], [4, 4, 1, 1, 1], True, False),
+            # cat
+            (["a", "b", "c", "c", None], [1, 2, 3, 4, 5], "c", True),
+            # float with invalid weight rows
+            ([1.0, 2.0, 2.0, np.nan, 3.0, 5.0], [2, 2, 2, 1, None, -1], 2.0, False),
+            # null majority
+            ([None, None, "a", "b"], [3, 3, 2, 1], "a", False),
+            # null majority cat
+            ([None, None, "a", "b"], [3, 3, 2, 1], "a", True),
+        ],
+    )
+    def test_learnt_values_weighted_df(
+        self,
+        library,
+        input_col,
+        weight_col,
+        learnt_value,
+        categorical,
+        lazy,
+    ):
+        """Test that the impute values learnt during fit are expected when df is weighted."""
+        df_dict = {
+            "col": input_col,
+            "weight": weight_col,
+        }
+
+        df = dataframe_init_dispatch(df_dict, library=library)
+
+        if categorical:
+            # create categorical col
+            df = nw.from_native(df)
+            df = nw.to_native(df.with_columns(nw.col("col").cast(nw.Categorical)))
+
+        columns = ["col"]
+        x = ModeImputer(columns=columns, weights_column="weight")
+
+        x.fit(_convert_to_lazy(df, lazy=lazy))
+
+        expected_impute_values = {
+            "col": learnt_value,
+        }
+
+        assert x.impute_values_ == expected_impute_values, (
+            f"impute_values_ attribute not as expected, expected {expected_impute_values} but got {x.impute_values_}"
+        )
+
+
+class TestTransform(
+    GenericTransformTests,
+    GenericImputerTransformTestsWeight,
+    GenericImputerTransformTests,
+    ReturnNativeTests,
+):
+    """Tests for transformer.transform."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.transformer_name = "ModeImputer"
+
+
+class TestLazyYSupport:
+    """Tests for lazy y support in ModeImputer."""
+
+    @pytest.mark.parametrize("library", ["polars"])
+    def test_lazy_y_accepted(self, library):
+        """Test that ModeImputer accepts LazyFrame for y parameter."""
+        df_dict = {"a": [1, 2, 3, 4, 5], "b": ["x", "y", "x", "x", None]}
+        df = dataframe_init_dispatch(df_dict, library)
+
+        y_lazy = pl.LazyFrame({"a": [1, 2, 3, 4, 5]})
+
+        transformer = ModeImputer(columns="b")
+
+        # Fit should accept lazy y and not raise an error
+        transformer.fit(df, y_lazy)
+
+        # Transform should work correctly (no nulls to impute, so unchanged)
+        expected = dataframe_init_dispatch(
+            {"a": [1, 2, 3, 4, 5], "b": ["x", "y", "x", "x", "x"]},
+            library,
+        )
+
+        transformed = transformer.transform(df)
+
+        assert_frame_equal_dispatch(transformed, expected)
+
+
+class TestOtherBaseBehaviour(
+    OtherBaseBehaviourTests,
+    EmptyColumnsFitTransformPassTests,
+):
+    """
+    Class to run tests for BaseTransformerBehaviour outside the three standard methods.
+
+    May need to overwrite specific tests in this class if the tested transformer modifies this behaviour.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        cls.transformer_name = "ModeImputer"

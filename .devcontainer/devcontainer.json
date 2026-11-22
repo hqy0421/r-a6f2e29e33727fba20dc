@@ -1,0 +1,20 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "Python 3.12 with uv",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	// Use 'postCreateCommand' to run commands after the container is created.
+	"postCreateCommand": "uv sync --locked --all-extras && prek install && echo 'source ${containerWorkspaceFolder}/.venv/bin/activate' >> ~/.bashrc",
+
+	// Configure tool-specific properties.
+	"customizations": {
+		// Configure properties specific to VS Code.
+		"vscode": {
+		  // Add the IDs of extensions you want installed when the container is created.
+		  "extensions": ["ms-python.vscode-pylance", "eamodio.gitlens", "ms-python.python"],
+		  "settings": {"python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python"}}
+		}
+}

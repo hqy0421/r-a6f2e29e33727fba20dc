@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import inspect
+import pkgutil
+from importlib import import_module
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+
+from tests.test_data import (
+    create_aggregate_over_rows_test_df,
+    create_bool_df,
+    create_categorical_df,
+    create_is_between_dates_df_1,
+    create_numeric_df_1,
+    create_object_df,
+    create_when_then_otherwise_test_df,
+)
+from tubular import base
+from tubular.functions.comparison import ConditionEnum
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+"""
+How To Use This Testing Framework
+-----------------------------------
+
+Fixtures in this file are used in tests for shared behaviour which can be run on multiple transformers through inheritance.
+setup_class is defined in each test class to define cls.transformer_name as the name of the transformer being tested.
+
+Test methods for shared behaviour are defined in base_tests.py or child test classes which are themselves inherited.  The
+fixtures in this file can be used in these tests to access initiated/ uninitiated transformers and minimum attributes for
+intiatialization.
+
+Test classes which can import tests for shared behaviour inherit from an appropriate parent and define cls.transformer_name
+in setup_class so that these fixtures will retrieve the appropriate transformer instance. setup_class is called by pytest
+at a class level before its test methods are run https://docs.pytest.org/en/8.0.x/how-to/xunit_setup.html.
+
+New transformers will need to be added to minimal_attribute_dict.
+ """
+
+
+def get_all_classes(
+    wanted_module: str | None = None,
+) -> dict[str, base.BaseTransformer]:
+    """Method to call the weighted_quantile method and prepare the outputs.
+
+    If there are no None values in the supplied quantiles then the outputs from weighted_quantile
+    are returned as is. If there are then prepare_quantiles removes the None values before
+    calling weighted_quantile and adds them back into the output, in the same position, after
+    calling.
+
+    Parameters
+    ----------
+    wanted_module : str or None
+        str indicating which module to load classes from (e.g. 'tubular.dates'). If none, loads from all modules.
+
+    Returns
+    -------
+    all_classes : dict[str, BaseTransformer]
+        Dictionary containing classes in format {transformer_name:transformer}
+
+    """
+    root = str(Path(__file__).parent.parent)
+
+    all_classes = []
+    modules_to_ignore = [
+        "tests",
+        "conftest",
+        "setup",
+    ]
+
+    for _importer, modname, _ispkg in pkgutil.walk_packages(
+        path=[root],
+    ):
+        if wanted_module and modname != wanted_module:
+            continue
+        mod_parts = modname.split(".")
+        if any(part in modules_to_ignore for part in mod_parts) or "_" in modname:
+            continue
+        module = import_module(modname)
+        classes = inspect.getmembers(module, inspect.isclass)
+
+        classes = [
+            (name, transformer)
+            for name, transformer in classes
+            if issubclass(transformer, base.BaseTransformer)
+        ]
+
+        all_classes.extend(classes)
+
+    return set(all_classes)
+
+
+@pytest.fixture
+def minimal_attribute_dict():
+    """defines minimal attributes (values) needed to initiate each transformer named (key).
+    New transformers need to be added here"""
+    return {
+        "ArbitraryImputer": {
+            "columns": ["b"],
+            "impute_value": 1,
+        },
+        "BaseCappingTransformer": {
+            "capping_values": {"a": [0.1, 0.2]},
+        },
+        "BaseGenericDateTransformer": {
+            "columns": ["a"],
+            "new_column_name": "bla",
+        },
+        "BaseDatetimeTransformer": {
+            "columns": ["a"],
+            "new_column_name": "bla",
+        },
+        "BaseImputer": {
+            "columns": ["b"],
+        },
+        "BaseMappingTransformer": {
+            "mappings": {"a": {1: 2, 3: 4}},
+            # this arg is dependent on inputs, so
+            # may not generalise well
+            "return_dtypes": {"a": "Int8"},
+        },
+        "BaseMappingTransformMixin": {
+            "columns": ["a"],
+        },
+        "BaseNumericTransformer": {
+            "columns": ["a", "b"],
+        },
+        "BaseTransformer": {
+            "columns": ["a"],
+        },
+        "BetweenDatesTransformer": {
+            "new_column_name": "e",
+            "columns": ["a", "c", "b"],
+        },
+        "BooleanImputer": {
+            "columns": ["b"],
+            "impute_value": True,
+        },
+        "CategoricalImputer": {
+            "columns": ["b"],
+            "impute_value": "bla",
+        },
+        "CappingTransformer": {
+            "capping_values": {"a": [0.1, 0.2]},
+        },
+        "ColumnDtypeSetter": {
+            "columns": ["a"],
+            "dtype": "String",
+        },
+        "DateDifferenceTransformer": {
+            "columns": ["a", "b"],
+            "new_column_name": "new_column",
+        },
+        "DatetimeInfoExtractor": {
+            "columns": ["a"],
+        },
+        "DatetimeComponentExtractor": {
+            "columns": ["a"],
+            "include": ["hour", "day", "month", "year"],
+        },
+        "DatetimeSinusoidCalculator": {
+            "columns": ["a"],
+            "method": ["sin"],
+            "units": "month",
+        },
+        "_EnumImputer": {
+            "columns": ["b"],
+            "impute_value": "value",
+        },
+        "ExtractStringComponentsTransformer": {
+            "columns": ["b"],
+            "by": "@",
+            "return_n_components": 1,
+        },
+        "GroupRareLevelsTransformer": {
+            "columns": ["b"],
+        },
+        "LowerCaseTransformer": {"columns": ["b"]},
+        "MappingTransformer": {
+            "mappings": {"a": {1: 2, 3: 4}},
+            # this arg is dependent on inputs, so
+            # may not generalise well
+            "return_dtypes": {"a": "Int8"},
+        },
+        "MeanImputer": {
+            "columns": ["b"],
+        },
+        "MeanResponseTransformer": {
+            "columns": ["b"],
+        },
+        "MedianImputer": {
+            "columns": ["b"],
+        },
+        "ModeImputer": {
+            "columns": ["b"],
+        },
+        "NullIndicator": {
+            "columns": ["a"],
+        },
+        "NumberImputer": {
+            "columns": ["b"],
+            "impute_value": 1,
+        },
+        "OneDKmeansTransformer": {
+            "columns": "a",
+            "new_column_name": "new",
+        },
+        "OneHotEncodingTransformer": {
+            "columns": ["a", "b"],
+            "separator": "-",
+        },
+        "OutOfRangeNullTransformer": {
+            "capping_values": {"a": [0.1, 0.2]},
+        },
+        "RemoveCharactersTransformer": {
+            "columns": ["b"],
+            "characters": [r"\s"],
+        },
+        "RenameColumnsTransformer": {
+            "columns": "a",
+            "new_column_names": {"a": "new_a"},
+        },
+        "SetValueTransformer": {
+            "value": 1,
+            "columns": ["a"],
+        },
+        "StringImputer": {
+            "columns": ["b"],
+            "impute_value": "missing",
+        },
+        "StringContainsTransformer": {
+            "columns": ["b"],
+            "reference": "c",
+            "reference_as_column": False,
+        },
+        "ToDatetimeTransformer": {
+            "columns": "a",
+            "time_format": "%d/%m/%Y",
+        },
+        "BaseAggregationTransformer": {
+            "columns": ["a", "b"],
+            "aggregations": ["min", "max"],
+        },
+        "AggregateRowsOverColumnTransformer": {
+            "columns": ["a", "b"],
+            "aggregations": ["min", "max"],
+            "key": "c",
+        },
+        "AggregateColumnsOverRowTransformer": {
+            "columns": ["a", "b"],
+            "aggregations": ["min", "max"],
+        },
+        "DifferenceTransformer": {
+            "columns": ["a", "b"],
+        },
+        "RatioTransformer": {
+            "columns": ["a", "b"],
+            "return_dtype": "Float32",  # Default dtype for the resulting column
+        },
+        "WhenThenOtherwiseTransformer": {
+            "columns": ["a"],
+            "when_column": "b",
+            "then_column": "c",
+        },
+        "CompareTwoColumnsTransformer": {
+            "columns": ["a", "b"],
+            "condition": ConditionEnum.GREATER_THAN.value,
+        },
+    }
+
+
+@pytest.fixture
+def minimal_dataframe_lookup(request) -> dict[str, pd.DataFrame]:
+    """links transformers to minimal dataframes needed to successfully run transformer. There is logic to do this automatically by module, so function will only need to be edited where either:
+    - a new module that operates primarily on non-numeric columns is added
+    - a new transformer is added to an existing module that breaks the pattern of that module, e.g. a transformer in dates.py that operates on numeric columns
+
+    Returns
+    -------
+
+    min_df_dict: dict[str, pd.DataFrame]
+        dictionary mapping transformers to minimal dataframes that they can successfully run on
+
+    """
+
+    # setup to default to pandas if not provided
+    library = getattr(request, "param", "pandas")
+
+    num_df = create_numeric_df_1(library=library)
+    object_df = create_object_df(library=library)
+    categorical_df = create_categorical_df(library=library)
+    date_df = create_is_between_dates_df_1(library=library)
+    agg_df = create_aggregate_over_rows_test_df(
+        library=library,
+    )
+    bool_df = create_bool_df(library=library)
+    when_then_df = create_when_then_otherwise_test_df(library=library)
+
+    # generally most transformers will work with num_df
+    min_df_dict = {x[0]: num_df for x in get_all_classes()}
+
+    # override dict value with date_df for transformers in tubular.dates
+    date_transformers = [x[0] for x in get_all_classes(wanted_module="tubular.dates")]
+    for transformer in date_transformers:
+        min_df_dict[transformer] = date_df
+
+    # override dict value for transformers that run on object type columns
+    object_modules = ["tubular.mapping", "tubular.nominal", "tubular.strings"]
+    object_transformers = []
+    for module in object_modules:
+        object_transformers += [x[0] for x in get_all_classes(wanted_module=module)]
+
+    for transformer in object_transformers:
+        min_df_dict[transformer] = object_df
+
+    # Some may require further manual overwrites
+    other_num_transformers = [
+        # prevent below two from being imported from import in nominal file
+        "MedianImputer",
+        "MeanImputer",
+    ]
+    for transformer in other_num_transformers:
+        min_df_dict[transformer] = num_df
+
+    min_df_dict["BaseAggregationTransformer"] = agg_df
+    min_df_dict["AggregateRowsOverColumnTransformer"] = agg_df
+    min_df_dict["WhenThenOtherwiseTransformer"] = when_then_df
+    min_df_dict["StringImputer"] = object_df
+    min_df_dict["CategoricalImputer"] = categorical_df
+    min_df_dict["BooleanImputer"] = bool_df
+
+    pyarrow_transformers = ["ExtractStringComponentsTransformer"]
+
+    if library == "pandas":
+        for transformer in pyarrow_transformers:
+            min_df_dict[transformer] = min_df_dict[transformer].convert_dtypes(
+                dtype_backend="pyarrow"
+            )
+
+    return min_df_dict
+
+
+@pytest.fixture
+def initialized_transformers(minimal_attribute_dict):
+    """dictionary of {transformer name : initiated transformer} pairs for all transformers"""
+    return {x[0]: x[1](**minimal_attribute_dict[x[0]]) for x in get_all_classes()}
+
+
+@pytest.fixture
+def uninitialized_transformers():
+    """dictionary of {transformer name : uninitiated transformer} pairs for all transformers"""
+    return {x[0]: x[1] for x in get_all_classes()}

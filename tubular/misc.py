@@ -1,0 +1,584 @@
+"""Contains legacy transformers for introducing fixed columns and changing dtypes."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import narwhals as nw
+from beartype import beartype
+
+from tubular._utils import (
+    _convert_dataframe_to_narwhals,
+    _return_narwhals_or_native_dataframe,
+    block_from_json,
+)
+from tubular.base import BaseTransformer, register
+from tubular.functions.misc import (
+    SimpleCastDtypesStr,
+    cast_columns,
+    rename_columns,
+    set_columns_to_value,
+)
+from tubular.types import (
+    DataFrame,
+    ListOfStrs,
+)
+
+
+@register
+class SetValueTransformer(BaseTransformer):
+    """Transformer to set value of column(s) to a given value.
+
+    This should be used if columns need to be set to a constant value.
+
+    Attributes
+    ----------
+    built_from_json: bool
+        indicates if transformer was reconstructed from json, which limits it's
+        supported functionality to .transform
+
+    polars_compatible : bool
+        class attribute, indicates whether transformer has been converted to
+        polars/pandas agnostic narwhals framework
+
+    jsonable: bool
+        class attribute, indicates if transformer supports to/from_json methods
+
+    FITS: bool
+        class attribute, indicates whether transform requires fit to be run first
+
+    lazyframe_compatible: bool
+        class attribute, indicates whether transformer works with lazyframes
+
+    Examples
+    --------
+    ```pycon
+    >>> SetValueTransformer(columns="a", value=1)
+    SetValueTransformer(columns=['a'], value=1)
+
+    ```
+
+    """
+
+    polars_compatible = True
+
+    lazyframe_compatible = True
+
+    FITS = False
+
+    jsonable = True
+
+    @beartype
+    def __init__(
+        self,
+        columns: ListOfStrs | str,
+        value: int | float | str | bool | None,
+        **kwargs: bool,
+    ) -> None:
+        """Initialise class instance.
+
+        Parameters
+        ----------
+        columns: list or str
+            Columns to set values.
+
+        value : various
+            Value to set.
+
+        **kwargs: bool
+            Arbitrary keyword arguments passed onto BaseTransformer.init method.
+
+        """
+        self.value = value
+
+        super().__init__(columns=columns, **kwargs)
+        self.is_fitted_ = True  # Does not fit
+
+    @block_from_json
+    def to_json(self) -> dict[str, dict[str, Any]]:
+        """Dump transformer to json dict.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]]:
+            jsonified transformer. Nested dict containing levels for attributes
+            set at init and fit.
+
+        Examples
+        --------
+        ```pycon
+        >>> transformer = SetValueTransformer(columns="a", value=1)
+        >>> transformer.to_json()
+        {'tubular_version': ..., 'classname': 'SetValueTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'value': 1}, 'fit': {'is_fitted_': True}}
+
+        ```
+
+        """  # noqa: E501
+        json_dict = super().to_json()
+
+        json_dict["init"]["value"] = self.value
+
+        return json_dict
+
+    def get_transform_exprs(self) -> list[nw.Expr]:
+        """Get transform expressions.
+
+        Returns
+        -------
+        list[nw.Expr]: transform expressions for class
+
+        """
+        return set_columns_to_value(
+            columns=self.columns,
+            value=self.value,
+        )
+
+    @beartype
+    def transform(self, X: DataFrame) -> DataFrame:
+        """Set columns to value.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Data to apply mappings to.
+
+        Returns
+        -------
+        X : DataFrame
+            Transformed input X with columns set to value.
+
+        Examples
+        --------
+        ```pycon
+        >>> import polars as pl
+
+        >>> transformer = SetValueTransformer(columns="a", value=1)
+
+        >>> test_df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+
+        >>> transformer.transform(test_df)
+        shape: (3, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i32 ┆ i64 │
+        ╞═════╪═════╡
+        │ 1   ┆ 4   │
+        │ 1   ┆ 5   │
+        │ 1   ┆ 6   │
+        └─────┴─────┘
+
+        ```
+
+        """
+        X = _convert_dataframe_to_narwhals(X)
+
+        X = super().transform(X, return_native_override=False)
+
+        transform_exprs = self.get_transform_exprs()
+
+        X = X.with_columns(*transform_exprs) if transform_exprs else X
+
+        return _return_narwhals_or_native_dataframe(X, self.return_native)
+
+
+@register
+class RenameColumnsTransformer(BaseTransformer):
+    """Transformer to rename a given set of columns.
+
+    This can be useful for personalising the auto-output names from
+    other transformers, or for creating a few different versions
+    of a given column to undergo separate paths of logic in a pipeline
+    (as the expression logic effectively creates duplicates of the column).
+
+    Attributes
+    ----------
+    built_from_json: bool
+        indicates if transformer was reconstructed from json, which limits it's
+        supported functionality to .transform
+
+    polars_compatible : bool
+        class attribute, indicates whether transformer has been converted to
+        polars/pandas agnostic narwhals framework
+
+    jsonable: bool
+        class attribute, indicates if transformer supports to/from_json methods
+
+    FITS: bool
+        class attribute, indicates whether transform requires fit to be run first
+
+    lazyframe_compatible: bool
+        class attribute, indicates whether transformer works with lazyframes
+
+    Examples
+    --------
+    ```pycon
+    >>> from pprint import pprint
+    >>> transformer = RenameColumnsTransformer(
+    ...     columns="a", new_column_names={"a": "new_a"}
+    ... )  # noqa: E501
+    >>> transformer
+    RenameColumnsTransformer(columns=['a'], new_column_names={'a': 'new_a'})
+
+    >>> # transformer can also be dumped to json and reinitialised
+
+    >>> json_dump = transformer.to_json()
+    >>> pprint(json_dump, sort_dicts=True)
+    {'classname': 'RenameColumnsTransformer',
+     'fit': {'is_fitted_': True},
+     'init': {'columns': ['a'],
+              'copy': False,
+              'new_column_names': {'a': 'new_a'},
+              'return_native': True,
+              'verbose': False},
+     'tubular_version': ...}
+
+    >>> RenameColumnsTransformer.from_json(json_dump)
+    RenameColumnsTransformer(columns=['a'], new_column_names={'a': 'new_a'})
+
+    ```
+
+    """
+
+    polars_compatible = True
+
+    lazyframe_compatible = True
+
+    FITS = False
+
+    jsonable = True
+
+    @beartype
+    def __init__(
+        self,
+        columns: ListOfStrs | str,
+        new_column_names: dict[str, str],
+        **kwargs: bool,
+    ) -> None:
+        """Initialise class instance.
+
+        Parameters
+        ----------
+        columns: list or str
+            Columns to set values.
+
+        new_column_names: dict[str, str]
+            dictionary mapping provided columns to updated names
+
+        **kwargs: bool
+            Arbitrary keyword arguments passed onto BaseTransformer.init method.
+
+        Raises
+        ------
+        ValueError: if provided columns are not keys of
+            provided new_column_names
+
+        """
+        super().__init__(columns=columns, **kwargs)
+
+        msg = f"{self.classname()}: all provided columns must appear as keys in new_column_names"  # noqa: E501
+        for column in self.columns:
+            if column not in new_column_names:
+                raise ValueError(msg)
+
+        self.new_column_names = new_column_names
+        self.is_fitted_ = True  # Does not fit
+
+    def get_feature_names_out(self) -> list[str]:
+        """List features modified/created by the transformer.
+
+        Returns
+        -------
+        list[str]:
+            list of features modified/created by the transformer
+
+        Examples
+        --------
+        ```pycon
+        >>> transformer = RenameColumnsTransformer(
+        ...     columns=["a", "b"],
+        ...     new_column_names={"a": "new_a", "b": "new_b"},
+        ... )
+
+        >>> transformer.get_feature_names_out()
+        ['new_a', 'new_b']
+
+        ```
+
+        """
+        return list(self.new_column_names.values())
+
+    @block_from_json
+    def to_json(self) -> dict[str, dict[str, Any]]:
+        """Dump transformer to json dict.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]]:
+            jsonified transformer. Nested dict containing levels for attributes
+            set at init and fit.
+
+        Examples
+        --------
+        ```pycon
+        >>> from pprint import pprint
+        >>> transformer = RenameColumnsTransformer(
+        ...     columns="a", new_column_names={"a": "new_a"}
+        ... )  # noqa: E501
+        >>> pprint(transformer.to_json(), sort_dicts=True)
+        {'classname': 'RenameColumnsTransformer',
+         'fit': {'is_fitted_': True},
+         'init': {'columns': ['a'],
+                  'copy': False,
+                  'new_column_names': {'a': 'new_a'},
+                  'return_native': True,
+                  'verbose': False},
+         'tubular_version': ...}
+
+        ```
+
+        """
+        json_dict = super().to_json()
+
+        json_dict["init"].update(
+            {
+                "new_column_names": self.new_column_names,
+            }
+        )
+
+        return json_dict
+
+    def get_transform_exprs(self) -> list[nw.Expr]:
+        """Get transform expressions.
+
+        Returns
+        -------
+        list[nw.Expr]: transform expressions for class
+
+        """
+        return rename_columns(
+            columns=self.columns,
+            new_column_names=self.new_column_names,
+        )
+
+    @beartype
+    def transform(self, X: DataFrame) -> DataFrame:
+        """Create column copies.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Data to apply mappings to.
+
+        Returns
+        -------
+        X : DataFrame
+            Transformed input X with columns set to value.
+
+        Raises
+        ------
+        ValueError: if new_column_names values are already present in X
+
+        Examples
+        --------
+        ```pycon
+        >>> import polars as pl
+
+        >>> transformer = RenameColumnsTransformer(
+        ...     columns="a", new_column_names={"a": "new_a"}
+        ... )  # noqa: E501
+
+        >>> test_df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+
+        >>> transformer.transform(test_df)
+        shape: (3, 3)
+        ┌─────┬─────┬───────┐
+        │ a   ┆ b   ┆ new_a │
+        │ --- ┆ --- ┆ ---   │
+        │ i64 ┆ i64 ┆ i64   │
+        ╞═════╪═════╪═══════╡
+        │ 1   ┆ 4   ┆ 1     │
+        │ 2   ┆ 5   ┆ 2     │
+        │ 3   ┆ 6   ┆ 3     │
+        └─────┴─────┴───────┘
+
+        ```
+
+        """
+        X = super().transform(X, return_native_override=False)
+
+        new_column_names_already_present = sorted(
+            set(self.new_column_names.values()).intersection(X.columns)
+        )
+        if new_column_names_already_present:
+            msg = f"{self.classname()}: The following new_column_names are already present in X, {new_column_names_already_present}"  # noqa: E501
+            raise ValueError(msg)
+
+        X = _convert_dataframe_to_narwhals(X)
+
+        transform_exprs = self.get_transform_exprs()
+
+        X = X.with_columns(*transform_exprs) if transform_exprs else X
+
+        return _return_narwhals_or_native_dataframe(X, self.return_native)
+
+
+@register
+class ColumnDtypeSetter(BaseTransformer):
+    """Transformer to set transform columns in a dataframe to a dtype.
+
+    Attributes
+    ----------
+    built_from_json: bool
+        indicates if transformer was reconstructed from json,
+        which limits it's supported functionality to .transform
+
+    polars_compatible : bool
+        class attribute, indicates whether transformer has been converted to
+        polars/pandas agnostic narwhals framework
+
+    jsonable: bool
+        class attribute, indicates if transformer supports to/from_json methods
+
+    FITS: bool
+        class attribute, indicates whether transform requires fit to be run first
+
+    lazyframe_compatible: bool
+        class attribute, indicates whether transformer works with lazyframes
+
+    deprecated: bool
+        indicates if class has been deprecated
+
+    """
+
+    polars_compatible = True
+
+    lazyframe_compatible = True
+
+    FITS = False
+
+    jsonable = True
+
+    deprecated = False
+
+    @beartype
+    def __init__(
+        self,
+        columns: str | ListOfStrs,
+        dtype: SimpleCastDtypesStr,
+        **kwargs: bool,
+    ) -> None:
+        """Initialise class instance.
+
+        Parameters
+        ----------
+        columns : Union[str, ListOfStrs]
+            Columns to set dtype. Must be set or transform will not run.
+
+        dtype : SimpleCastDtypesStr
+            dtype to set column to
+
+        **kwargs: dict[str, Any]
+            Arbitrary keyword arguments passed onto BaseTransformer.init method.
+
+        """
+        super().__init__(columns, **kwargs)
+
+        self.dtype = dtype
+        self.is_fitted_ = True  # Does not fit
+
+    @block_from_json
+    def to_json(self) -> dict[str, dict[str, Any]]:
+        """Dump transformer to json dict.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]]:
+            jsonified transformer. Nested dict containing levels for attributes
+            set at init and fit.
+
+        Examples
+        --------
+        ```pycon
+        >>> from pprint import pprint
+        >>> transformer = ColumnDtypeSetter(columns="a", dtype="Float32")
+        >>> pprint(transformer.to_json(), sort_dicts=True)
+        {'classname': 'ColumnDtypeSetter',
+         'fit': {'is_fitted_': True},
+         'init': {'columns': ['a'],
+                  'copy': False,
+                  'dtype': 'Float32',
+                  'return_native': True,
+                  'verbose': False},
+         'tubular_version': ...}
+
+        ```
+
+        """
+        json_dict = super().to_json()
+
+        json_dict["init"]["dtype"] = self.dtype
+
+        return json_dict
+
+    def get_transform_exprs(self) -> list[nw.Expr]:
+        """Get transform expressions.
+
+        Returns
+        -------
+        list[nw.Expr]: transform expressions for class
+
+        """
+        return cast_columns(
+            columns=self.columns,
+            dtype=self.dtype,
+        )
+
+    def transform(self, X: DataFrame) -> DataFrame:
+        """Transform data.
+
+        Parameters
+        ----------
+        X: DataFrame
+            data to transform.
+
+        Returns
+        -------
+            DataFrame: transformed data
+
+        Examples
+        --------
+        ```pycon
+        >>> import polars as pl
+        >>> df = pl.DataFrame({"a": [1, 2]})
+        >>> transformer = ColumnDtypeSetter(columns="a", dtype="Float32")
+        >>> transformer.transform(df)
+        shape: (2, 1)
+        ┌─────┐
+        │ a   │
+        │ --- │
+        │ f32 │
+        ╞═════╡
+        │ 1.0 │
+        │ 2.0 │
+        └─────┘
+
+        ```
+
+        """
+        X = _convert_dataframe_to_narwhals(X)
+        backend = nw.get_native_namespace(X).__name__
+
+        X = super().transform(X, return_native_override=False)
+
+        if backend == "pandas" and self.dtype == "Boolean":
+            X = X.with_columns(
+                nw.maybe_convert_dtypes(X[col]).cast(nw.Boolean) for col in self.columns
+            )
+
+        else:
+            transform_exprs = self.get_transform_exprs()
+
+            X = X.with_columns(*transform_exprs) if transform_exprs else X
+
+        return _return_narwhals_or_native_dataframe(X, self.return_native)

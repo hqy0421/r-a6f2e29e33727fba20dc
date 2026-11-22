@@ -1,0 +1,366 @@
+import math
+import numbers
+from contextlib import suppress
+from functools import wraps
+from importlib.metadata import version
+from typing import Any, Literal
+
+import narwhals as nw
+import pandas as pd
+import polars as pl
+from beartype import beartype
+from narwhals.typing import IntoDType
+from numpy.typing import ArrayLike
+
+from tubular.types import DataFrame, LazyFrame, NarwhalsFrame, Series
+
+
+@beartype
+def _collect_frame(X: DataFrame) -> NarwhalsFrame:
+    """Collect lazyframes, or return inputs if eager.
+
+    Parameters
+    ----------
+    X: DataFrame
+        DataFrame to be collected if lazy
+
+    Returns
+    -------
+    nw.DataFrame: collected frame
+
+    """
+    if isinstance(X, nw.LazyFrame):
+        X = X.collect()
+
+    return X
+
+
+@beartype
+def _convert_dataframe_to_narwhals(X: DataFrame) -> NarwhalsFrame:
+    """Narwhalifies dataframe, if dataframe is not already narwhals.
+
+    Parameters
+    ----------
+    X: DataFrame
+        DataFrame to narwhalify if pd/pl type
+
+    Returns
+    -------
+    NarwhalsFrame: narwhalified dataframe
+
+    """
+    if not isinstance(X, (nw.DataFrame, nw.LazyFrame)):
+        X = nw.from_native(X)
+
+    return X
+
+
+@beartype
+def _collect_series(y: nw.Series | nw.LazyFrame | None = None) -> nw.Series | None:
+    """Collect lazy series/frames, or return inputs if eager.
+
+    Parameters
+    ----------
+    y: nw.Series or nw.LazyFrame
+        Series or LazyFrame to be collected if lazy
+
+    Returns
+    -------
+    nw.Series: collected series
+
+    """
+    if y is None:
+        return None
+
+    if isinstance(y, nw.LazyFrame):
+        # Collect directly without converting to native first
+        collected_df = y.collect()
+        # Get the first column as a Series
+        col_name = collected_df.collect_schema().names()[0]
+        y = collected_df.get_column(col_name)
+
+    return y
+
+
+@beartype
+def _convert_series_to_narwhals(
+    y: Series | LazyFrame | None = None,
+) -> nw.Series | nw.LazyFrame | None:
+    """Narwhalifies series, if series is not already narwhals.
+
+    Parameters
+    ----------
+    y: Series
+        series to narwhalify if pd/pl type
+
+    Returns
+    -------
+    nw.Series: narwhalified series
+
+    """
+    if y is not None and not isinstance(y, (nw.Series, nw.LazyFrame)):
+        y = nw.from_native(y, allow_series=True)
+
+    return y
+
+
+@beartype
+def _return_narwhals_or_native_dataframe(
+    X: DataFrame,
+    return_native: bool,
+) -> DataFrame:
+    """Narwhalifies series, if series is not already narwhals.
+
+    Parameters
+    ----------
+    X: DataFrame
+        DataFrame to process and return
+
+    return_native: bool
+        whether to return narwhals or native dataframe/lazyframe
+
+    Returns
+    -------
+    DataFrame: processed dataframe in correct type
+
+    """
+    if return_native:
+        if isinstance(X, (nw.DataFrame, nw.LazyFrame)):
+            return X.to_native()
+
+        # type hint and beartype means we don't have to check here,
+        # will be pandas or polars  frame
+        return X
+
+    if isinstance(X, (pl.DataFrame, pd.DataFrame, pl.LazyFrame)):
+        return nw.from_native(X)
+
+    # type hint and beartype means we don't have to check here,
+    # will be pandas or polars  frame
+    return X
+
+
+def _assess_pandas_object_column(pandas_df: pd.DataFrame, col: str) -> tuple[str, str]:
+    """Determine less generic type for object columns.
+
+    Parameters
+    ----------
+    pandas_df: pd.DataFrame
+        pandas df to assess
+
+    col: str
+        column to assess
+
+    Returns
+    -------
+    pandas_col_type: str
+        deduced pandas col type
+
+    polars_col_type: str
+        deduced polars col type
+
+    Raises
+    ------
+    TypeError: if provided column is not object type
+
+    """
+    if pandas_df[col].dtype.name != "object":
+        msg = "_assess_pandas_object_column only works with object dtype columns"
+        raise TypeError(
+            msg,
+        )
+
+    pandas_col_type = "object"
+    polars_col_type = "Object"
+
+    # pandas would assign dtype object to bools with nulls, but have values like True
+    # it would also assign all null cols to object, but have values like None
+    # creating a polars col with object type would give values like 'true', 'none'
+    # overwrite these cases for better handling
+    if pandas_df[col].notna().sum() == 0:
+        pandas_col_type = "null"
+        polars_col_type = "Unknown"
+
+    # check if all non-null values are bool
+    elif sum(isinstance(value, bool) for value in pandas_df[col] if value):
+        pandas_col_type = "bool"
+        polars_col_type = "Boolean"
+
+    # we may wish to add more cases in future, but starting with these
+
+    return pandas_col_type, polars_col_type
+
+
+def new_narwhals_series_with_optimal_pandas_types(
+    name: str,
+    values: ArrayLike,
+    backend: Literal["pandas", "polars"],
+    dtype: IntoDType,
+) -> nw.Series:
+    """Wrap around nw.new_series to ensure that pandas doesn't default to non-nullable types.
+
+    Parameters
+    ----------
+    name:
+        name of new series
+
+    values:
+        values for new series
+
+    backend:
+        data processing package to use (pandas or polars)
+
+    dtype:
+        wanted narwhals dtype for output
+
+    Returns
+    -------
+    nw.Series: new narwhals series
+
+    """
+    if backend == "pandas":
+        series = pd.Series(name=name, data=values)
+        series = nw.maybe_convert_dtypes(nw.from_native(series, allow_series=True))
+        # for int/float values, we may still want to cast to better type
+        # (e.g. int8)
+        # but for bool/str values, maybe_convert_types has already
+        # cast to improved typing, so avoid further casting for these
+        if dtype not in {nw.String, nw.Object, nw.Boolean}:
+            series = series.cast(dtype)
+
+    else:
+        series = nw.new_series(name=name, values=values, backend=backend, dtype=dtype)
+
+    return series
+
+
+def _get_version() -> str:
+    """Dynamically retrieve package version.
+
+    Returns
+    -------
+        str: package version
+
+    """
+    with suppress(ModuleNotFoundError):
+        return version("tubular")
+
+    return "dev"
+
+
+def block_from_json(method):  # noqa: ANN202, ANN001,  no annotations for generic decorator
+    """Intercept method and raise a runtime error if the transformer has been initialised from_json.
+
+    i.e. if the built_from_json attr is True.
+
+    Returns
+    -------
+        Callable: wrapped method
+
+    """
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202, no annotations for generic decorator
+        if self.built_from_json:
+            msg = "Transformers that are reconstructed from json only support .transform functionality, reinitialise a new transformer to use this method"
+            raise RuntimeError(
+                msg,
+            )
+
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _is_null(value: Any) -> bool:  # noqa: ANN401
+    """Check if value if None/NaN.
+
+    Returns
+    -------
+        bool: True if value is None/NaN
+
+    """
+    return value is None or (
+        math.isnan(value) if isinstance(value, numbers.Real) else False
+    )
+
+
+def _sort_dict(dictionary: dict) -> dict:
+    """Sort dictionary by keys.
+
+    Parameters
+    ----------
+    dictionary:
+        dictionary to sort
+
+    Returns
+    -------
+        dict: sorted dictionary
+
+    """
+    return {k: dictionary[k] for k in sorted(dictionary, key=lambda x: (x is None, x))}
+
+
+def _sort_nested_dict(dictionary: dict) -> dict:
+    """Sort nested dictionary by keys.
+
+    Parameters
+    ----------
+    dictionary:
+        dictionary to sort
+
+    Returns
+    -------
+        dict: sorted dictionary
+
+    """
+    return {
+        key: _sort_nested_dict(dictionary[key])
+        if isinstance(dictionary[key], dict)
+        else dictionary[key]
+        for key in _sort_dict(dictionary)
+    }
+
+
+def _filter_column_dict(
+    dictionary: dict[str, Any], columns: list[str]
+) -> dict[str, Any]:
+    """Filter column keyed dictionary with list of provided columns.
+
+    Parameters
+    ----------
+    dictionary:
+        dictionary to filter
+
+    columns:
+        list of columns to filter for.
+
+    Returns
+    -------
+    dict: filtered dictionary
+
+    """
+    return {key: dictionary[key] for key in dictionary if key in columns}
+
+
+def _null_safe_string_cast(input_expr: nw.Expr, handle_nans: bool = False) -> nw.Expr:
+    """Cast column to string without corrupting null values.
+
+    Parameters
+    ----------
+    input_expr:
+        expression to cast
+
+    handle_nans:
+        indicates whether expression needs to handle nan values
+    (i.e. for float columns).
+
+    Returns
+    -------
+    nw.Expr: expression for safely casting to string
+
+    """
+    filter_expr = ~input_expr.is_null()
+    if handle_nans:
+        filter_expr &= ~input_expr.is_nan()
+    return nw.when(filter_expr).then(input_expr.cast(nw.String)).otherwise(None)
