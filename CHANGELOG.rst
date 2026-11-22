@@ -31,6 +31,7 @@ Each individual change should have a link to the pull request after the descript
 -------------------
 Changed
 ^^^^^^^
+- feat: OneDKmeansTransformer can now select the smallest bucket count that explains a target share of dispersion via the new `min_explained_dispersion` argument (with `n_clusters` acting as the cap). Fit stores `centers_`, `bucket_population_` and `explained_dispersion_`; transform scores each value by its nearest centre using deterministic, reviewable tie-breaking rules. This replaces the previous `bins` attribute, so json saved with earlier versions is not compatible.
 - chore: switched codespaces and github actions to use pyproject.toml for env, removed req.text file
 - feat: added min/max version testing in github actions
 - chore: removed cap on polars version

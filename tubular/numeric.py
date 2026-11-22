@@ -194,15 +194,65 @@ class BaseNumericTransformer(BaseTransformer, CheckNumericMixin):
         return _return_narwhals_or_native_dataframe(X, return_native)
 
 
+def _assign_to_buckets(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    """Assign each value to the bucket of its nearest centre.
+
+    Bucket boundaries are the midpoints between consecutive sorted
+    centres. A value sitting exactly on a boundary is assigned to the
+    lower bucket, i.e. the bucket with the smaller centre. The rule is
+    deterministic so that assignments can be reviewed and reproduced
+    outside of this package.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Values to assign to buckets.
+
+    centers : np.ndarray
+        Bucket centres, sorted ascending with no duplicates.
+
+    Returns
+    -------
+    np.ndarray
+        Integer bucket labels, aligned with the order of centers.
+
+    """
+    boundaries = centers[:-1] + (centers[1:] - centers[:-1]) / 2
+
+    return np.digitize(values, boundaries, right=True)
+
+
 @register
 class OneDKmeansTransformer(BaseNumericTransformer):
-    """Generates a new column based on kmeans algorithm.
+    """Discretises a numeric column into buckets found by 1D k-means.
 
-    Transformer runs the kmeans algorithm based on given number of clusters and then identifies the bins' cuts based on the results.
-    Finally it passes them into the a cut function.
+    Transformer runs the kmeans algorithm on the column and treats the
+    cluster centres as bucket centres. If ``min_explained_dispersion`` is
+    set, fit selects the smallest number of buckets that explains at least
+    that share of the total dispersion (sum of squared distances to the
+    column mean), never exceeding ``n_clusters`` buckets. Otherwise
+    exactly ``n_clusters`` buckets are formed.
+
+    Fit stores the selected centres (``centers_``), the effective
+    population of each bucket in the fit data (``bucket_population_``) and
+    the share of dispersion explained by the selected buckets
+    (``explained_dispersion_``). Transform only uses ``centers_``: each
+    value is assigned to the bucket of its nearest centre.
 
     Attributes
     ----------
+    centers_ : list of float
+        Bucket centres selected at fit, sorted ascending. This is the only
+        fitted attribute used by transform.
+
+    bucket_population_ : list of int
+        Effective population of each bucket in the fit data, aligned with
+        ``centers_``. Stored for review and monitoring, not used by
+        transform.
+
+    explained_dispersion_ : float
+        Share of the total dispersion explained by the selected buckets.
+
     built_from_json: bool
         indicates if transformer was reconstructed from json, which limits it's supported
         functionality to .transform
@@ -218,6 +268,18 @@ class OneDKmeansTransformer(BaseNumericTransformer):
 
     lazyframe_compatible: bool
         class attribute, indicates whether transformer works with lazyframes
+
+    Notes
+    -----
+    Bucket assignment follows deterministic, reviewable rules:
+
+    - the number of buckets never exceeds the number of distinct values
+      seen at fit time (empty or duplicated clusters are not created);
+    - identical centres are merged into a single bucket at fit time;
+    - a value exactly halfway between two centres is assigned to the
+      lower bucket (the one with the smaller centre);
+    - equal values are always assigned to the same bucket, so duplicate
+      values each count towards ``bucket_population_``.
 
     Examples
     --------
@@ -266,10 +328,10 @@ class OneDKmeansTransformer(BaseNumericTransformer):
         OneDKmeansTransformer(columns=['a'], kmeans_kwargs={'random_state': 42},
                               n_clusters=2, new_column_name='new')
         >>> x.to_json()
-        {'tubular_version': ..., 'classname': 'OneDKmeansTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'new_column_name': 'new', 'n_init': 'auto', 'n_clusters': 2, 'kmeans_kwargs': {'random_state': 42}}, 'fit': {'is_fitted_': True, 'bins': [3, 4]}}
+        {'tubular_version': ..., 'classname': 'OneDKmeansTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'new_column_name': 'new', 'n_init': 'auto', 'n_clusters': 2, 'kmeans_kwargs': {'random_state': 42}, 'min_explained_dispersion': None}, 'fit': {'is_fitted_': True, 'centers_': [2.0, 4.0], 'bucket_population_': [3, 1], 'explained_dispersion_': 0.6}}
 
         """
-        self.check_is_fitted(["bins"])
+        self.check_is_fitted(["centers_", "bucket_population_"])
         json_dict = super().to_json()
 
         json_dict["init"].update(
@@ -278,20 +340,24 @@ class OneDKmeansTransformer(BaseNumericTransformer):
                 "n_init": self.n_init,
                 "n_clusters": self.n_clusters,
                 "kmeans_kwargs": self.kmeans_kwargs,
+                "min_explained_dispersion": self.min_explained_dispersion,
             },
         )
-        json_dict["fit"]["bins"] = self.bins
+        json_dict["fit"]["centers_"] = self.centers_
+        json_dict["fit"]["bucket_population_"] = self.bucket_population_
+        json_dict["fit"]["explained_dispersion_"] = self.explained_dispersion_
 
         return json_dict
 
     @beartype
-    def __init__(
+    def __init__(  # noqa: PLR0917, PLR0913
         self,
         columns: str | ListOfOneStr,
         new_column_name: str,
         n_init: str | int = "auto",
         n_clusters: int = 8,
         kmeans_kwargs: dict[str, object] | None = None,
+        min_explained_dispersion: float | None = None,
         **kwargs: bool,
     ) -> None:
         """Initialise class instance.
@@ -306,6 +372,8 @@ class OneDKmeansTransformer(BaseNumericTransformer):
 
         n_clusters : int, default = 8
             The number of clusters to form as well as the number of centroids to generate.
+            When min_explained_dispersion is set, this acts as the upper cap on the
+            number of buckets selected at fit.
 
         n_init: "auto" or int, default="auto"
             Number of times the k-means algorithm is run with different centroid seeds.
@@ -318,17 +386,46 @@ class OneDKmeansTransformer(BaseNumericTransformer):
         kmeans_kwargs : dict, default = {}
             A dictionary of keyword arguments to be passed to the sklearn KMeans method when it is called in fit.
 
+        min_explained_dispersion : float or None, default = None
+            Minimum share of the total dispersion (between 0 and 1) that the
+            selected buckets must explain. If None, exactly n_clusters buckets
+            are formed. If set, fit tries increasing bucket counts from 1 up to
+            n_clusters and keeps the smallest count reaching this threshold;
+            n_clusters is used when no smaller count reaches it.
+
         **kwargs
             Arbitrary keyword arguments passed onto BaseTransformer.init().
+
+        Raises
+        ------
+        ValueError:
+            if n_clusters is below 1 or min_explained_dispersion is outside
+            [0, 1].
 
         """
         if kmeans_kwargs is None:
             kmeans_kwargs = {}
 
+        if n_clusters < 1:
+            msg = (
+                f"{self.classname()}: n_clusters must be at least 1, got {n_clusters}."
+            )
+            raise ValueError(msg)
+
+        if min_explained_dispersion is not None and not (
+            0.0 <= min_explained_dispersion <= 1.0
+        ):
+            msg = (
+                f"{self.classname()}: min_explained_dispersion must be between "
+                f"0 and 1, got {min_explained_dispersion}."
+            )
+            raise ValueError(msg)
+
         self.n_clusters = n_clusters
         self.new_column_name = new_column_name
         self.n_init = n_init
         self.kmeans_kwargs = kmeans_kwargs
+        self.min_explained_dispersion = min_explained_dispersion
 
         if isinstance(columns, str):
             self.columns = [columns]
@@ -369,6 +466,13 @@ class OneDKmeansTransformer(BaseNumericTransformer):
     @nw.narwhalify
     def fit(self, X: FrameT, y: IntoSeriesT | None = None) -> OneDKmeansTransformer:
         """Fit transformer to input data.
+
+        Learns the bucket centres and stores them in ``centers_`` together
+        with the effective population of each bucket in the fit data
+        (``bucket_population_``) and the share of dispersion explained by
+        the selected buckets (``explained_dispersion_``). If
+        ``min_explained_dispersion`` is set, the smallest bucket count
+        reaching that threshold (capped at ``n_clusters``) is selected.
 
         Parameters
         ----------
@@ -421,40 +525,69 @@ class OneDKmeansTransformer(BaseNumericTransformer):
             msg = f"{self.classname()}: X should not contain missing values."
             raise ValueError(msg)
 
-        kmeans = KMeans(
-            n_clusters=self.n_clusters,
-            n_init=self.n_init,
-            **self.kmeans_kwargs,
-        )
+        values = X.select(self.columns[0]).to_numpy().ravel().astype(np.float64)
 
-        native_backend = nw.get_native_namespace(X).__name__
-        groups = kmeans.fit_predict(X.select(self.columns[0]).to_numpy())
+        # reviewable rule: buckets are capped at the number of distinct
+        # values, extra clusters would be empty or duplicated
+        n_unique = np.unique(values).size
+        max_buckets = min(self.n_clusters, n_unique)
 
-        X = X.with_columns(
-            nw.new_series(
-                name="groups",
-                values=np.copy(groups),
-                backend=native_backend,
-            ),
-        )
+        total_dispersion = float(np.sum((values - values.mean()) ** 2))
 
-        self.bins = (
-            X.group_by("groups")
-            .agg(
-                nw.col(self.columns[0]).max(),
+        if self.min_explained_dispersion is None:
+            candidate_bucket_counts = [max_buckets]
+        else:
+            candidate_bucket_counts = range(1, max_buckets + 1)
+
+        best_model = None
+        explained_dispersion = 0.0
+        for n_buckets in candidate_bucket_counts:
+            kmeans = KMeans(
+                n_clusters=n_buckets,
+                n_init=self.n_init,
+                **self.kmeans_kwargs,
             )
-            .sort(self.columns[0])
-            .select(self.columns[0])
-            .to_numpy()
-            .ravel()
-            .tolist()
-        )
+            best_model = kmeans.fit(values.reshape(-1, 1))
+
+            if n_unique == 1:
+                # a single distinct value means there is no dispersion to
+                # explain, one bucket trivially explains everything
+                explained_dispersion = 1.0
+            else:
+                # clamp away float noise, the explained share lies in [0, 1]
+                explained_dispersion = min(
+                    1.0,
+                    max(0.0, 1.0 - best_model.inertia_ / total_dispersion),
+                )
+
+            if (
+                self.min_explained_dispersion is not None
+                and explained_dispersion >= self.min_explained_dispersion
+            ):
+                # smallest bucket count explaining enough of the dispersion
+                break
+
+        # reviewable rule: identical centres are merged into a single
+        # bucket, np.unique also sorts the centres ascending
+        centers = np.unique(best_model.cluster_centers_.ravel())
+
+        assignments = _assign_to_buckets(values, centers)
+
+        self.centers_ = centers.tolist()
+        self.bucket_population_ = np.bincount(
+            assignments,
+            minlength=centers.size,
+        ).tolist()
+        self.explained_dispersion_ = float(explained_dispersion)
         self.is_fitted_ = True
         return self
 
     @nw.narwhalify
     def transform(self, X: FrameT) -> FrameT:
-        """Generate from input pd/pl.DataFrame (X) bins based on Kmeans results and add this column or columns in X.
+        """Assign each row to the bucket of its nearest fitted centre.
+
+        Only the centres stored at fit are used; the bucket populations
+        are fit-time review information and play no part in scoring.
 
         Parameters
         ----------
@@ -502,10 +635,11 @@ class OneDKmeansTransformer(BaseNumericTransformer):
         X = nw.from_native(X)
         native_backend = nw.get_native_namespace(X).__name__
 
-        groups = np.digitize(
-            X.select(self.columns[0]).to_numpy().ravel(),
-            bins=self.bins,
-            right=True,
+        values = X.select(self.columns[0]).to_numpy().ravel().astype(np.float64)
+
+        groups = _assign_to_buckets(
+            values,
+            np.asarray(self.centers_, dtype=np.float64),
         )
 
         return X.with_columns(
